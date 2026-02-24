@@ -58,6 +58,7 @@
 | [`js`](https://github.com/zentinelproxy/zentinel-agent-js) | Custom logic via JavaScript |
 | [`wasm`](https://github.com/zentinelproxy/zentinel-agent-wasm) | Run WebAssembly modules in the request pipeline |
 | [`transform`](https://github.com/zentinelproxy/zentinel-agent-transform) | Request / response header and body transforms |
+| [`image-optimization`](https://github.com/zentinelproxy/zentinel-agent-image-optimization) | On-the-fly JPEG/PNG to WebP/AVIF conversion with caching |
 | [`mock-server`](https://github.com/zentinelproxy/zentinel-agent-mock-server) | Stub responses for testing |
 | [`chaos`](https://github.com/zentinelproxy/zentinel-agent-chaos) | Fault injection for resilience testing |
 | [`mqtt-gateway`](https://github.com/zentinelproxy/zentinel-agent-mqtt-gateway) | MQTT protocol gateway |
