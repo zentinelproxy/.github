@@ -1,0 +1,437 @@
+name: Agent release
+
+# Reusable release pipeline for Zentinel agents. See agent-smoke/README.md.
+#
+# A caller's release.yml is a few lines:
+#
+#   on:
+#     push:
+#       tags: ['v*']
+#     workflow_dispatch:
+#   permissions:
+#     contents: write          # the publish job inherits this
+#   jobs:
+#     release:
+#       uses: zentinelproxy/.github/.github/workflows/agent-release.yml@v1
+#       with:
+#         binary: zentinel-foo-agent
+#         smoke-command: scripts/smoke-test.sh
+#
+# What it does, in order:
+#
+#   1. plan: the tag must equal `v` + the version of the package that owns
+#      `binary`; a release for the tag must not exist yet; resolve the
+#      Zentinel release to smoke-test against (default: the latest).
+#   2. build (one job per platform, on a native runner): build `binary` with
+#      `--locked` from the checked-out ref (the tag), strip it, check that
+#      `--version` prints "<binary> <version>", download and sha256-verify
+#      that Zentinel release, run `smoke-command`, then package
+#      <binary>-<version>-<platform>.tar.gz and its .sha256.
+#   3. publish: only on a tag push, only after every platform passed, and
+#      only if `publish` is true: check every asset is there and create the
+#      GitHub release. `gh release create` fails if the release exists, so a
+#      published release is never replaced.
+#
+# Any other event (workflow_dispatch, push to a branch, pull_request) is a dry
+# run: everything except publishing. A CI caller can therefore run the same
+# pipeline on one platform with `platforms: '["linux-x86_64"]'`.
+#
+# The asset names are what `zentinel bundle install` downloads
+# (crates/proxy/src/bundle/lock.rs in zentinelproxy/zentinel):
+#   https://github.com/<repo>/releases/download/v<ver>/<binary>-<ver>-<platform>.tar.gz
+
+on:
+  workflow_call:
+    inputs:
+      binary:
+        description: Name of the agent binary (the [[bin]] name), e.g. zentinel-waf-agent.
+        required: true
+        type: string
+      smoke-command:
+        description: >-
+          Shell command run in the repository root after the build, on every
+          platform. It gets AGENT_BIN, ZENTINEL_BIN, AGENT_SMOKE (path to
+          agent-smoke/smoke.py), AGENT_VERSION, PLATFORM and ZENTINEL_RELEASE
+          in the environment. Must exit 0 for the release to go ahead.
+        required: true
+        type: string
+      platforms:
+        description: >-
+          JSON list of platforms to build, smoke-test and publish. Known:
+          linux-x86_64, linux-aarch64, darwin-aarch64, darwin-x86_64.
+        required: false
+        type: string
+        default: '["linux-x86_64", "linux-aarch64", "darwin-aarch64"]'
+      zentinel-version:
+        description: Zentinel release tag to smoke-test against (e.g. 26.10_7), or "latest".
+        required: false
+        type: string
+        default: latest
+      cargo-features:
+        description: Value for `cargo build --features` (empty for none).
+        required: false
+        type: string
+        default: ''
+      cargo-no-default-features:
+        description: Build with --no-default-features.
+        required: false
+        type: boolean
+        default: false
+      apt-packages:
+        description: Extra apt packages installed on Linux before the build (space-separated).
+        required: false
+        type: string
+        default: protobuf-compiler
+      brew-packages:
+        description: Extra Homebrew packages installed on macOS before the build (space-separated).
+        required: false
+        type: string
+        default: protobuf
+      setup-linux:
+        description: >-
+          Extra shell run on Linux after the apt packages and before the build
+          (e.g. building libmodsecurity from source). It may append to
+          $GITHUB_ENV / $GITHUB_PATH.
+        required: false
+        type: string
+        default: ''
+      setup-macos:
+        description: Extra shell run on macOS after the Homebrew packages and before the build.
+        required: false
+        type: string
+        default: ''
+      siblings:
+        description: >-
+          Repositories the build needs next to the checkout (path
+          dependencies such as ../zentinel), one per line as
+          `owner/repo@ref`, cloned to ../<repo> at that ref. Use a commit
+          SHA or tag: a branch makes the build depend on when it ran.
+        required: false
+        type: string
+        default: ''
+      rust-toolchain:
+        description: Toolchain for dtolnay/rust-toolchain.
+        required: false
+        type: string
+        default: stable
+      harness-ref:
+        description: >-
+          Ref of zentinelproxy/.github to take agent-smoke/smoke.py from.
+          Keep it equal to the ref this workflow is called at.
+        required: false
+        type: string
+        default: v1
+      publish:
+        description: Publish on a tag push. False makes every run a dry run.
+        required: false
+        type: boolean
+        default: true
+      cache:
+        description: Cache ~/.cargo and target between runs (useful for CI callers, off for releases).
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      version:
+        description: The package version that was built.
+        value: ${{ jobs.plan.outputs.version }}
+      zentinel-release:
+        description: The Zentinel release the smoke test ran against.
+        value: ${{ jobs.plan.outputs.zentinel }}
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY: ${{ inputs.binary }}
+
+jobs:
+  plan:
+    name: Check version and plan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      zentinel: ${{ steps.z.outputs.release }}
+      matrix: ${{ steps.m.outputs.matrix }}
+      publish: ${{ steps.v.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone siblings
+        if: inputs.siblings != ''
+        env:
+          SIBLINGS: ${{ inputs.siblings }}
+        run: |
+          set -euo pipefail
+          while read -r spec; do
+            [ -n "$spec" ] || continue
+            repo=${spec%@*}; ref=${spec##*@}
+            [ "$repo" != "$spec" ] || { echo "::error::sibling '$spec' is not owner/repo@ref"; exit 1; }
+            dir="$GITHUB_WORKSPACE/../${repo##*/}"
+            echo "Cloning $repo at $ref into $dir"
+            git init -q "$dir"
+            git -C "$dir" fetch -q --depth 1 "https://github.com/$repo.git" "$ref"
+            git -C "$dir" checkout -q FETCH_HEAD
+            git -C "$dir" log -1 --format='  %H %s'
+          done <<< "$SIBLINGS"
+
+      - id: v
+        name: Check the tag against the package version
+        env:
+          PUBLISH_INPUT: ${{ inputs.publish }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r --arg bin "$BINARY" '[.packages[] | select(any(.targets[]; .name == $bin and (.kind | index("bin")))) | .version] | first // empty')
+          if [ -z "$version" ]; then
+            echo "::error::No package in this repository has a binary named '$BINARY'"
+            exit 1
+          fi
+          echo "Package version of $BINARY: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          publish=false
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME does not match the package version $version. Bump Cargo.toml (and Cargo.lock) in a commit first and tag that commit."
+              exit 1
+            fi
+            if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::Release $GITHUB_REF_NAME already exists. A published release is never replaced; bump the version instead."
+              exit 1
+            fi
+            [ "$PUBLISH_INPUT" = "true" ] && publish=true
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          if [ "$publish" = true ]; then
+            echo "Will publish $GITHUB_REF_NAME if every platform passes."
+          else
+            echo "Dry run ($GITHUB_EVENT_NAME on $GITHUB_REF): nothing will be published."
+          fi
+
+      - id: z
+        name: Resolve the Zentinel release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT: ${{ inputs.zentinel-version }}
+        run: |
+          set -euo pipefail
+          if [ "$WANT" = "latest" ]; then
+            release=$(gh release view --repo zentinelproxy/zentinel --json tagName -q .tagName)
+          else
+            release=$(gh release view "$WANT" --repo zentinelproxy/zentinel --json tagName -q .tagName)
+          fi
+          echo "Smoke-testing against Zentinel $release"
+          echo "release=$release" >> "$GITHUB_OUTPUT"
+
+      - id: m
+        name: Build the platform matrix
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          matrix=$(jq -c '
+            {
+              "linux-x86_64":   {os: "ubuntu-24.04",     target: "x86_64-unknown-linux-gnu",  zentinel: "linux-amd64"},
+              "linux-aarch64":  {os: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-gnu", zentinel: "linux-arm64"},
+              "darwin-aarch64": {os: "macos-14",         target: "aarch64-apple-darwin",      zentinel: "darwin-arm64"},
+              "darwin-x86_64":  {os: "macos-13",         target: "x86_64-apple-darwin",       zentinel: "darwin-amd64"}
+            } as $known
+            | if (type != "array" or length == 0) then error("platforms must be a non-empty JSON list") else . end
+            | map(. as $p | ($known[$p] // error("unknown platform: \($p)")) + {platform: $p})
+            | {include: .}' <<< "$PLATFORMS")
+          echo "$matrix" | jq .
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and smoke-test ${{ matrix.platform }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.plan.outputs.version }}
+      ZENTINEL_RELEASE: ${{ needs.plan.outputs.zentinel }}
+      TARGET: ${{ matrix.target }}
+      PLATFORM: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Clone siblings
+        if: inputs.siblings != ''
+        env:
+          SIBLINGS: ${{ inputs.siblings }}
+        run: |
+          set -euo pipefail
+          while read -r spec; do
+            [ -n "$spec" ] || continue
+            repo=${spec%@*}; ref=${spec##*@}
+            [ "$repo" != "$spec" ] || { echo "::error::sibling '$spec' is not owner/repo@ref"; exit 1; }
+            dir="$GITHUB_WORKSPACE/../${repo##*/}"
+            echo "Cloning $repo at $ref into $dir"
+            git init -q "$dir"
+            git -C "$dir" fetch -q --depth 1 "https://github.com/$repo.git" "$ref"
+            git -C "$dir" checkout -q FETCH_HEAD
+            git -C "$dir" log -1 --format='  %H %s'
+          done <<< "$SIBLINGS"
+
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ inputs.rust-toolchain }}
+          targets: ${{ matrix.target }}
+
+      - name: Install build dependencies (Linux)
+        if: runner.os == 'Linux' && inputs.apt-packages != ''
+        env:
+          PACKAGES: ${{ inputs.apt-packages }}
+        run: |
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y $PACKAGES
+
+      - name: Install build dependencies (macOS)
+        if: runner.os == 'macOS' && inputs.brew-packages != ''
+        env:
+          PACKAGES: ${{ inputs.brew-packages }}
+        run: |
+          # shellcheck disable=SC2086
+          brew install $PACKAGES
+
+      - name: Extra setup (Linux)
+        if: runner.os == 'Linux' && inputs.setup-linux != ''
+        run: ${{ inputs.setup-linux }}
+
+      - name: Extra setup (macOS)
+        if: runner.os == 'macOS' && inputs.setup-macos != ''
+        run: ${{ inputs.setup-macos }}
+
+      - uses: Swatinem/rust-cache@v2
+        if: inputs.cache
+        with:
+          key: agent-release-${{ matrix.target }}
+
+      - name: Build
+        env:
+          FEATURES: ${{ inputs.cargo-features }}
+          NO_DEFAULT: ${{ inputs.cargo-no-default-features }}
+        run: |
+          set -euo pipefail
+          args=(--release --locked --target "$TARGET" --bin "$BINARY")
+          [ -n "$FEATURES" ] && args+=(--features "$FEATURES")
+          [ "$NO_DEFAULT" = "true" ] && args+=(--no-default-features)
+          echo "cargo build ${args[*]}"
+          cargo build "${args[@]}"
+          echo "AGENT_BIN=$PWD/target/$TARGET/release/$BINARY" >> "$GITHUB_ENV"
+
+      - name: Strip
+        run: strip "$AGENT_BIN"
+
+      - name: Check the binary reports the release version
+        run: |
+          set -euo pipefail
+          out=$("$AGENT_BIN" --version)
+          echo "$out"
+          if [ "$out" != "$BINARY $VERSION" ]; then
+            echo "::error::'$BINARY --version' printed '$out', expected '$BINARY $VERSION'"
+            exit 1
+          fi
+
+      - name: Download Zentinel ${{ needs.plan.outputs.zentinel }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZENTINEL_PLATFORM: ${{ matrix.zentinel }}
+        run: |
+          set -euo pipefail
+          asset="zentinel-${ZENTINEL_RELEASE}-${ZENTINEL_PLATFORM}.tar.gz"
+          mkdir -p "$RUNNER_TEMP/zentinel"
+          cd "$RUNNER_TEMP/zentinel"
+          gh release download "$ZENTINEL_RELEASE" --repo zentinelproxy/zentinel \
+            --pattern "$asset" --pattern "$asset.sha256"
+          shasum -a 256 -c "$asset.sha256"
+          tar xzf "$asset"
+          ./zentinel --version
+          echo "ZENTINEL_BIN=$RUNNER_TEMP/zentinel/zentinel" >> "$GITHUB_ENV"
+
+      - name: Fetch the smoke harness (zentinelproxy/.github@${{ inputs.harness-ref }})
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HARNESS_REF: ${{ inputs.harness-ref }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/agent-smoke"
+          gh api -H 'Accept: application/vnd.github.raw' \
+            "repos/zentinelproxy/.github/contents/agent-smoke/smoke.py?ref=$HARNESS_REF" \
+            > "$RUNNER_TEMP/agent-smoke/smoke.py"
+          echo "AGENT_SMOKE=$RUNNER_TEMP/agent-smoke/smoke.py" >> "$GITHUB_ENV"
+
+      - name: Smoke test behind Zentinel ${{ needs.plan.outputs.zentinel }}
+        env:
+          AGENT_VERSION: ${{ needs.plan.outputs.version }}
+        run: ${{ inputs.smoke-command }}
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          name="${BINARY}-${VERSION}-${PLATFORM}.tar.gz"
+          mkdir -p "$RUNNER_TEMP/dist"
+          tar -czf "$RUNNER_TEMP/dist/$name" -C "$(dirname "$AGENT_BIN")" "$BINARY"
+          cd "$RUNNER_TEMP/dist"
+          shasum -a 256 "$name" > "$name.sha256"
+          tar -tzf "$name"
+          cat "$name.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.binary }}-${{ matrix.platform }}
+          path: ${{ runner.temp }}/dist/*
+          retention-days: 7
+          if-no-files-found: error
+
+  # No `permissions:` here on purpose: the job inherits the caller's, so a
+  # release caller grants `contents: write` and a CI caller (publish never
+  # runs) can stay read-only.
+  publish:
+    name: Publish GitHub release
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: ${{ inputs.binary }}-*
+          merge-multiple: true
+
+      - name: Check every asset is present
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          set -euo pipefail
+          for p in $(jq -r '.[]' <<< "$PLATFORMS"); do
+            f="artifacts/${BINARY}-${VERSION}-${p}.tar.gz"
+            test -f "$f" || { echo "::error::missing $f"; exit 1; }
+            test -f "$f.sha256" || { echo "::error::missing $f.sha256"; exit 1; }
+            (cd artifacts && shasum -a 256 -c "$(basename "$f").sha256")
+          done
+          ls -l artifacts
+
+      # Fails if a release for this tag already exists: a published release
+      # is never replaced in place.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ZENTINEL_RELEASE: ${{ needs.plan.outputs.zentinel }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Smoke-tested behind Zentinel ${ZENTINEL_RELEASE} on every platform before publishing." \
+            --generate-notes
