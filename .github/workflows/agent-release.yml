@@ -235,8 +235,8 @@ jobs:
             {
               "linux-x86_64":   {os: "ubuntu-24.04",     target: "x86_64-unknown-linux-gnu",  zentinel: "linux-amd64"},
               "linux-aarch64":  {os: "ubuntu-24.04-arm", target: "aarch64-unknown-linux-gnu", zentinel: "linux-arm64"},
-              "darwin-aarch64": {os: "macos-14",         target: "aarch64-apple-darwin",      zentinel: "darwin-arm64"},
-              "darwin-x86_64":  {os: "macos-13",         target: "x86_64-apple-darwin",       zentinel: "darwin-amd64"}
+              "darwin-aarch64": {os: "macos-15",         target: "aarch64-apple-darwin",      zentinel: "darwin-arm64"},
+              "darwin-x86_64":  {os: "macos-15-intel",   target: "x86_64-apple-darwin",       zentinel: "darwin-amd64"}
             } as $known
             | if (type != "array" or length == 0) then error("platforms must be a non-empty JSON list") else . end
             | map(. as $p | ($known[$p] // error("unknown platform: \($p)")) + {platform: $p})

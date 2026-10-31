@@ -43,8 +43,8 @@ https://github.com/<repo>/releases/download/v<version>/<binary>-<version>-<platf
 |---|---|---|---|
 | `linux-x86_64` | `ubuntu-24.04` | `x86_64-unknown-linux-gnu` | `linux-amd64` |
 | `linux-aarch64` | `ubuntu-24.04-arm` | `aarch64-unknown-linux-gnu` | `linux-arm64` |
-| `darwin-aarch64` | `macos-14` | `aarch64-apple-darwin` | `darwin-arm64` |
-| `darwin-x86_64` | `macos-13` | `x86_64-apple-darwin` | `darwin-amd64` |
+| `darwin-aarch64` | `macos-15` | `aarch64-apple-darwin` | `darwin-arm64` |
+| `darwin-x86_64` | `macos-15-intel` | `x86_64-apple-darwin` | `darwin-amd64` |
 
 The default is the first three, which is what `bundle-versions.lock` lists.
 
